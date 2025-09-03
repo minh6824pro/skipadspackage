@@ -1,0 +1,21 @@
+package handler
+
+import (
+	"SkipAds/internal"
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+)
+
+func RegisterRoutes(router *gin.RouterGroup, db *gorm.DB) {
+	repo := internal.NewRepositoryImpl(db)
+	service := internal.NewService(repo, db)
+	controller := NewController(service)
+
+	ads := router.Group("")
+	{
+		ads.GET("/remaining_skip/:id", controller.GetRemainingSkipAds)
+		ads.POST("/purchase/", controller.CreatePurchase)
+		ads.GET("/purchase/:id", controller.GetPurchaseByUserID)
+		ads.POST("/skip/", controller.SkipAds)
+	}
+}
