@@ -43,7 +43,7 @@ func (controller *Controller) GetPurchaseByUserID(ctx *gin.Context) {
 
 func (controller *Controller) GetRemainingSkipAds(ctx *gin.Context) {
 	id, _ := strconv.Atoi(ctx.Param("id"))
-	skipAds, err := controller.service.GetRemainingSkipAds(ctx, uint(id))
+	skipAds, err := controller.service.GetRemainingSkipAds2(ctx, uint(id))
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -57,7 +57,7 @@ func (controller *Controller) SkipAds(ctx *gin.Context) {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	err := controller.service.SkipAds(ctx, user.ID)
+	err := controller.service.SkipAds2(ctx, user.ID, 1)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
 		return

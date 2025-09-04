@@ -11,6 +11,7 @@ func AutoMigrate() {
 		&models.Usage{},
 		&models.Purchase{},
 		&models.User{},
+		&models.PackageDailyStatus{},
 	)
 
 	if err != nil {

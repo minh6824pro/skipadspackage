@@ -4,13 +4,15 @@ import (
 	"SkipAds/internal/models"
 	"context"
 	"gorm.io/gorm"
+	"time"
 )
 
 type Repository interface {
 	CreatePurchase(ctx context.Context, purchase *models.Purchase) error
 	ListPurchaseByUserID(ctx context.Context, userID uint) ([]models.Purchase, error)
-	ListRemainingPurchaseByUserID(ctx context.Context, userID uint) ([]models.Purchase, error)
+	ListNotExpirePurchaseByUserID(ctx context.Context, userID uint) ([]models.Purchase, error)
 	GetPackage(ctx context.Context, packageID uint) (*models.Package, error)
+	//FindUsageByPurchaseID(ctx context.Context, purchaseID uint) (*models.Usage, error)
 }
 
 type repositoryImpl struct {
@@ -37,20 +39,24 @@ func (r repositoryImpl) CreatePurchase(ctx context.Context, purchase *models.Pur
 }
 
 // ListPurchaseByUserID
-// Get all purchase history of users
-func (r repositoryImpl) ListPurchaseByUserID(ctx context.Context, userID uint) ([]models.Purchase, error) {
+func (r repositoryImpl) ListNotExpirePurchaseByUserID(ctx context.Context, userID uint) ([]models.Purchase, error) {
 	var purchases []models.Purchase
-	if err := r.DB.Where("user_id = ?", userID).Find(&purchases).Error; err != nil {
+	if err := r.DB.Where("user_id = ? AND expires_at> ? ", userID, time.Now()).
+		Preload("Package").
+		Preload("Usages", func(db *gorm.DB) *gorm.DB {
+			return db.Order("created_at DESC")
+		}).Find(&purchases).Error; err != nil {
 		return nil, err
 	}
 	return purchases, nil
 }
 
 // ListRemainingPurchaseByUserID
-// Get purchases which have remaining skip ads > 0
-func (r repositoryImpl) ListRemainingPurchaseByUserID(ctx context.Context, userID uint) ([]models.Purchase, error) {
+func (r repositoryImpl) ListPurchaseByUserID(ctx context.Context, userID uint) ([]models.Purchase, error) {
 	var purchases []models.Purchase
-	err := r.DB.Where("user_id = ? AND remaining > ?", userID, 0).Find(&purchases).Error
+	err := r.DB.Where("user_id = ?", userID).
+		Preload("Package").
+		Find(&purchases).Error
 	if err != nil {
 		return nil, err
 	}
