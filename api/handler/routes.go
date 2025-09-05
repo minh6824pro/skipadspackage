@@ -6,9 +6,9 @@ import (
 	"gorm.io/gorm"
 )
 
-func RegisterRoutes(router *gin.RouterGroup, db *gorm.DB) {
+func RegisterRoutes(router *gin.RouterGroup, db *gorm.DB, redisService internal.RedisPackageService) {
 	repo := internal.NewRepositoryImpl(db)
-	service := internal.NewService(repo, db)
+	service := internal.NewService(repo, db, redisService)
 	controller := NewController(service)
 
 	ads := router.Group("")
