@@ -31,6 +31,21 @@ func (controller *Controller) CreatePurchase(ctx *gin.Context) {
 	ctx.JSON(http.StatusCreated, m)
 }
 
+func (controller *Controller) CreateBatchPurchase(ctx *gin.Context) {
+	var m []models.BatchPurchaseRequest
+	if err := ctx.ShouldBindJSON(&m); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	err := controller.service.CreateBatchPurchase(ctx, 2, m)
+
+	if err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	ctx.JSON(http.StatusCreated, m)
+}
+
 func (controller *Controller) GetPurchaseByUserID(ctx *gin.Context) {
 	id, _ := strconv.Atoi(ctx.Param("id"))
 	purchase, err := controller.service.GetPurchaseByUserID(ctx, uint(id))
