@@ -1,7 +1,7 @@
 package internal
 
 import (
-	"SkipAds/internal/models"
+	"SkipAds/internal/dtos"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,10 +11,10 @@ import (
 )
 
 type RedisPackageService interface {
-	SetUserPackages(ctx context.Context, userID uint, packages []models.AvailablePackageUser) error
-	GetUserPackages(ctx context.Context, userID uint) ([]models.AvailablePackageUser, error)
+	SetUserPackages(ctx context.Context, userID uint, packages []dtos.AvailablePackageUser) error
+	GetUserPackages(ctx context.Context, userID uint) ([]dtos.AvailablePackageUser, error)
 	DeleteUserPackages(ctx context.Context, userID uint) error
-	UpdateUserPackages(ctx context.Context, userID uint, packages []models.AvailablePackageUser) error
+	UpdateUserPackages(ctx context.Context, userID uint, packages []dtos.AvailablePackageUser) error
 	ExecuteLuaScript(ctx context.Context, script string, keys []string, args ...interface{}) (interface{}, error)
 	AcquireLock(ctx context.Context, key string, expiration time.Duration) (bool, error)
 	ReleaseLock(ctx context.Context, key string) error
@@ -39,7 +39,7 @@ func NewRedisPackageService(client *redis.Client) RedisPackageService {
 }
 
 // Set packages array for user
-func (r *redisPackageService) SetUserPackages(ctx context.Context, userID uint, packages []models.AvailablePackageUser) error {
+func (r *redisPackageService) SetUserPackages(ctx context.Context, userID uint, packages []dtos.AvailablePackageUser) error {
 	key := fmt.Sprintf(KeyPattern, userID)
 
 	// Convert array to JSON
@@ -53,7 +53,7 @@ func (r *redisPackageService) SetUserPackages(ctx context.Context, userID uint, 
 }
 
 // Get packages array for user
-func (r *redisPackageService) GetUserPackages(ctx context.Context, userID uint) ([]models.AvailablePackageUser, error) {
+func (r *redisPackageService) GetUserPackages(ctx context.Context, userID uint) ([]dtos.AvailablePackageUser, error) {
 	key := fmt.Sprintf(KeyPattern, userID)
 
 	// Get JSON from Redis
@@ -66,7 +66,7 @@ func (r *redisPackageService) GetUserPackages(ctx context.Context, userID uint) 
 	}
 
 	// Unmarshal JSON to array
-	var packages []models.AvailablePackageUser
+	var packages []dtos.AvailablePackageUser
 	if err := json.Unmarshal([]byte(jsonData), &packages); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal packages: %w", err)
 	}
@@ -75,7 +75,7 @@ func (r *redisPackageService) GetUserPackages(ctx context.Context, userID uint) 
 }
 
 // Update packages array for user
-func (r *redisPackageService) UpdateUserPackages(ctx context.Context, userID uint, packages []models.AvailablePackageUser) error {
+func (r *redisPackageService) UpdateUserPackages(ctx context.Context, userID uint, packages []dtos.AvailablePackageUser) error {
 	// Same as SetUserPackages - overwrite the entire array
 	return r.SetUserPackages(ctx, userID, packages)
 }

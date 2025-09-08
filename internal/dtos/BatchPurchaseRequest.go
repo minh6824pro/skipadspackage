@@ -1,4 +1,4 @@
-package models
+package dtos
 
 type BatchPurchaseRequest struct {
 	PackageID uint   `json:"package_id"`

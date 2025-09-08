@@ -1,4 +1,4 @@
-package models
+package dtos
 
 type UsedPackageInfo struct {
 	PurchaseID     uint   `json:"purchase_id"`

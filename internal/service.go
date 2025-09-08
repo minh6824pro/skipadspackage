@@ -1,15 +1,18 @@
 package internal
 
 import (
+	"SkipAds/internal/dtos"
 	"SkipAds/internal/models"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
+	"time"
+
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
-	"log"
-	"time"
 )
 
 type Service interface {
@@ -17,7 +20,7 @@ type Service interface {
 	CreatePurchase(ctx context.Context, purchase *models.Purchase) error
 	GetRemainingSkipAds2(ctx context.Context, userID uint) (uint32, error)
 	SkipAds2(ctx context.Context, userID uint, quantity uint32) error
-	CreateBatchPurchase(ctx context.Context, userID uint32, requests []models.BatchPurchaseRequest) error
+	CreateBatchPurchase(ctx context.Context, userID uint32, requests []dtos.BatchPurchaseRequest) error
 }
 
 type serviceImpl struct {
@@ -66,7 +69,6 @@ func (s *serviceImpl) GetRemainingSkipAds2(ctx context.Context, userID uint) (ui
         AND p.remaining > 0
     `, today, userID).Scan(&results).Error
 
-	log.Println(results)
 	if err != nil {
 		return 0, err
 	}
@@ -321,6 +323,141 @@ func (s *serviceImpl) waitAndRetryCache(ctx context.Context, userID uint, luaScr
 	log.Printf("Max retries exceeded for user %d, proceeding with direct DB access", userID)
 	return s.skipAdsFromDB(ctx, userID, quantity, today)
 }
+
+//func (s *serviceImpl) skipAdsFromDB(ctx context.Context, userID uint, quantity uint32, today time.Time) error {
+//	tx := s.db.Begin()
+//	defer func() {
+//		if r := recover(); r != nil {
+//			tx.Rollback()
+//		}
+//	}()
+//
+//	// Get available packages with SELECT ... FOR UPDATE to lock rows
+//	var availablePackagesUser []dtos.AvailablePackageUser
+//	err := tx.Raw(`
+//        SELECT
+//            p.id as purchase_id,
+//            p.remaining,
+//            pkg.max_usage_per_day,
+//            COALESCE(daily.used_today, 0) as used_today,
+//            CAST(UNIX_TIMESTAMP(p.expires_at) AS UNSIGNED) AS expires_at_unix
+//        FROM purchases p
+//        JOIN packages pkg ON p.package_id = pkg.id
+//        LEFT JOIN package_daily_statuses daily ON p.id = daily.purchase_id AND daily.date = ?
+//        WHERE p.user_id = ?
+//        AND p.expires_at > NOW()
+//        AND p.remaining > 0
+//        AND pkg.max_usage_per_day > COALESCE(daily.used_today, 0)
+//        ORDER BY p.expires_at ASC
+//        FOR UPDATE
+//    `, today, userID).Scan(&availablePackagesUser).Error
+//
+//	if err != nil {
+//		tx.Rollback()
+//		return err
+//	}
+//
+//	// Calculate total available
+//	totalAvailable := uint32(0)
+//	for _, pkg := range availablePackagesUser {
+//		dailyAvailable := min(pkg.Remaining, pkg.MaxUsagePerDay-pkg.UsedToday)
+//		totalAvailable += dailyAvailable
+//	}
+//
+//	if totalAvailable < quantity {
+//		tx.Rollback()
+//		return errors.New("insufficient quota")
+//	}
+//
+//	// Distribute usage to packages
+//	remainingToUse := quantity
+//	var validPackagesForCache []dtos.AvailablePackageUser
+//
+//	for i, pkg := range availablePackagesUser {
+//		if remainingToUse == 0 {
+//			break
+//		}
+//
+//		dailyAvailable := min(pkg.Remaining, pkg.MaxUsagePerDay-pkg.UsedToday)
+//		useFromThis := min(remainingToUse, dailyAvailable)
+//
+//		if useFromThis > 0 {
+//			// Update Purchase.remaining
+//			result := tx.Model(&models.Purchase{}).
+//				Where("id = ? AND remaining >= ?", pkg.PurchaseID, useFromThis).
+//				Update("remaining", gorm.Expr("remaining - ?", useFromThis))
+//
+//			if result.Error != nil {
+//				tx.Rollback()
+//				return result.Error
+//			}
+//
+//			if result.RowsAffected == 0 {
+//				tx.Rollback()
+//				return errors.New("concurrent usage detected - insufficient quota")
+//			}
+//
+//			// Update daily status
+//			err = s.updateOrCreateDailyStatus(ctx, tx, pkg.PurchaseID, today, useFromThis, pkg.MaxUsagePerDay)
+//			if err != nil {
+//				tx.Rollback()
+//				return err
+//			}
+//
+//			// Create usage record
+//			usage := models.Usage{
+//				PurchaseID:  pkg.PurchaseID,
+//				UseQuantity: useFromThis,
+//				UseFor:      "skip_ads",
+//				CreatedAt:   time.Now(),
+//			}
+//
+//			if err := tx.Create(&usage).Error; err != nil {
+//				tx.Rollback()
+//				return err
+//			}
+//
+//			remainingToUse -= useFromThis
+//			availablePackagesUser[i].UsedToday += useFromThis
+//			availablePackagesUser[i].Remaining -= useFromThis
+//		}
+//
+//	}
+//
+//	if remainingToUse > 0 {
+//		tx.Rollback()
+//		return errors.New("failed to allocate all quota")
+//	}
+//
+//	// Only cache packages that have usable skip ads
+//	// Check after update:  remaining > 0 And not reach daily limit
+//	for _, pkg := range availablePackagesUser {
+//		updatedPkg := pkg
+//		if updatedPkg.Remaining > 0 && updatedPkg.UsedToday < updatedPkg.MaxUsagePerDay {
+//			validPackagesForCache = append(validPackagesForCache, updatedPkg)
+//		}
+//	}
+//
+//	// Commit transaction
+//	if err := tx.Commit().Error; err != nil {
+//		return err
+//	}
+//
+//	// Only cache packages that have usable skip ads
+//	if len(validPackagesForCache) > 0 {
+//		if err := s.redisService.SetUserPackages(ctx, userID, validPackagesForCache); err != nil {
+//			log.Printf("Failed to update cache after DB operation for user %d: %v", userID, err)
+//		}
+//	} else {
+//		// If no valid packages left, delete cache
+//		if err := s.redisService.DeleteUserPackages(ctx, userID); err != nil {
+//			log.Printf("Failed to delete cache for user %d: %v", userID, err)
+//		}
+//	}
+//
+//	return nil
+//}
+
 func (s *serviceImpl) skipAdsFromDB(ctx context.Context, userID uint, quantity uint32, today time.Time) error {
 	tx := s.db.Begin()
 	defer func() {
@@ -329,32 +466,83 @@ func (s *serviceImpl) skipAdsFromDB(ctx context.Context, userID uint, quantity u
 		}
 	}()
 
-	// Get available packages with SELECT ... FOR UPDATE to lock rows
-	var availablePackagesUser []models.AvailablePackageUser
+	// Step 1: Get available purchases first (lock only user's purchases)
+	var userPurchases []struct {
+		ID        uint      `json:"purchase_id"`
+		Remaining uint32    `json:"remaining"`
+		PackageID uint      `json:"package_id"`
+		ExpiresAt time.Time `json:"expires_at"`
+		UsedToday uint32    `json:"used_today"`
+	}
+
 	err := tx.Raw(`
         SELECT 
-            p.id as purchase_id,
+            p.id,
             p.remaining,
-            pkg.max_usage_per_day,
-            COALESCE(daily.used_today, 0) as used_today,
-            CAST(UNIX_TIMESTAMP(p.expires_at) AS UNSIGNED) AS expires_at_unix
+            p.package_id,
+            p.expires_at,
+            COALESCE(daily.used_today, 0) as used_today
         FROM purchases p
-        JOIN packages pkg ON p.package_id = pkg.id
-        LEFT JOIN package_daily_statuses daily ON p.id = daily.purchase_id AND daily.date = ?
+        LEFT JOIN package_daily_statuses daily 
+            ON p.id = daily.purchase_id AND daily.date = ?
         WHERE p.user_id = ? 
-        AND p.expires_at > NOW() 
-        AND p.remaining > 0
-        AND pkg.max_usage_per_day > COALESCE(daily.used_today, 0)
-        ORDER BY p.expires_at ASC
-        FOR UPDATE  
-    `, today, userID).Scan(&availablePackagesUser).Error
+          AND p.expires_at > NOW() 
+          AND p.remaining > 0
+        ORDER BY p.expires_at ASC, p.id ASC
+        FOR UPDATE  -- Only lock user's purchases
+    `, today, userID).Scan(&userPurchases).Error
 
 	if err != nil {
 		tx.Rollback()
 		return err
 	}
 
-	// Calculate total available
+	if len(userPurchases) == 0 {
+		tx.Rollback()
+		return errors.New("no available purchases")
+	}
+
+	// Step 2: Get package info separately (no lock needed)
+	packageIDs := make([]uint, len(userPurchases))
+	for i, purchase := range userPurchases {
+		packageIDs[i] = purchase.PackageID
+	}
+
+	var packages []models.Package
+	if err := tx.Where("id IN (?)", packageIDs).Find(&packages).Error; err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	// Create package map for quick lookup
+	packageMap := make(map[uint]models.Package)
+	for _, pkg := range packages {
+		packageMap[pkg.ID] = pkg
+	}
+
+	// Step 3: Build available packages with package info
+	var availablePackagesUser []dtos.AvailablePackageUser
+	for _, purchase := range userPurchases {
+		pkg, exists := packageMap[purchase.PackageID]
+		if !exists {
+			continue // Skip if package not found
+		}
+
+		// Check if package has quota available today
+		if pkg.MaxUsagePerDay <= purchase.UsedToday {
+			continue // Skip if daily limit reached
+		}
+
+		availablePackagesUser = append(availablePackagesUser, dtos.AvailablePackageUser{
+			PurchaseID:     purchase.ID,
+			Remaining:      purchase.Remaining,
+			MaxUsagePerDay: pkg.MaxUsagePerDay,
+			UsedToday:      purchase.UsedToday,
+			ExpiresAtUnix:  purchase.ExpiresAt.Unix(),
+		})
+	}
+
+	// Step 4: Calculate total available
 	totalAvailable := uint32(0)
 	for _, pkg := range availablePackagesUser {
 		dailyAvailable := min(pkg.Remaining, pkg.MaxUsagePerDay-pkg.UsedToday)
@@ -366,59 +554,49 @@ func (s *serviceImpl) skipAdsFromDB(ctx context.Context, userID uint, quantity u
 		return errors.New("insufficient quota")
 	}
 
-	// Distribute usage to packages
+	// Step 5: Prepare batch data (same as before)
 	remainingToUse := quantity
-	var validPackagesForCache []models.AvailablePackageUser
+	var updates []struct {
+		ID        uint
+		Decrement uint32
+	}
+	var usages []models.Usage
+	var dailyUpdates []struct {
+		PurchaseID uint
+		Increment  uint32
+		MaxPerDay  uint32
+	}
 
 	for i, pkg := range availablePackagesUser {
 		if remainingToUse == 0 {
 			break
 		}
-
 		dailyAvailable := min(pkg.Remaining, pkg.MaxUsagePerDay-pkg.UsedToday)
 		useFromThis := min(remainingToUse, dailyAvailable)
 
 		if useFromThis > 0 {
-			// Update Purchase.remaining
-			result := tx.Model(&models.Purchase{}).
-				Where("id = ? AND remaining >= ?", pkg.PurchaseID, useFromThis).
-				Update("remaining", gorm.Expr("remaining - ?", useFromThis))
+			updates = append(updates, struct {
+				ID        uint
+				Decrement uint32
+			}{ID: pkg.PurchaseID, Decrement: useFromThis})
 
-			if result.Error != nil {
-				tx.Rollback()
-				return result.Error
-			}
-
-			if result.RowsAffected == 0 {
-				tx.Rollback()
-				return errors.New("concurrent usage detected - insufficient quota")
-			}
-
-			// Update daily status
-			err = s.updateOrCreateDailyStatus(ctx, tx, pkg.PurchaseID, today, useFromThis, pkg.MaxUsagePerDay)
-			if err != nil {
-				tx.Rollback()
-				return err
-			}
-
-			// Create usage record
-			usage := models.Usage{
+			usages = append(usages, models.Usage{
 				PurchaseID:  pkg.PurchaseID,
 				UseQuantity: useFromThis,
 				UseFor:      "skip_ads",
 				CreatedAt:   time.Now(),
-			}
+			})
 
-			if err := tx.Create(&usage).Error; err != nil {
-				tx.Rollback()
-				return err
-			}
+			dailyUpdates = append(dailyUpdates, struct {
+				PurchaseID uint
+				Increment  uint32
+				MaxPerDay  uint32
+			}{pkg.PurchaseID, useFromThis, pkg.MaxUsagePerDay})
 
 			remainingToUse -= useFromThis
 			availablePackagesUser[i].UsedToday += useFromThis
 			availablePackagesUser[i].Remaining -= useFromThis
 		}
-
 	}
 
 	if remainingToUse > 0 {
@@ -426,12 +604,49 @@ func (s *serviceImpl) skipAdsFromDB(ctx context.Context, userID uint, quantity u
 		return errors.New("failed to allocate all quota")
 	}
 
-	// Only cache packages that have usable skip ads
-	// Check after update:  remaining > 0 And not reach daily limit
-	for _, pkg := range availablePackagesUser {
-		updatedPkg := pkg
-		if updatedPkg.Remaining > 0 && updatedPkg.UsedToday < updatedPkg.MaxUsagePerDay {
-			validPackagesForCache = append(validPackagesForCache, updatedPkg)
+	// Step 6: Batch operations (same as before)
+	// Batch update purchases.remaining using CASE WHEN
+	if len(updates) > 0 {
+		caseSQL := "CASE id"
+		var ids []interface{}
+		for _, u := range updates {
+			caseSQL += fmt.Sprintf(" WHEN %d THEN remaining - %d", u.ID, u.Decrement)
+			ids = append(ids, u.ID)
+		}
+		caseSQL += " END"
+
+		query := fmt.Sprintf("UPDATE purchases SET remaining = %s WHERE id IN (?)", caseSQL)
+		if err := tx.Exec(query, ids).Error; err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+
+	// Batch upsert daily_status
+	if len(dailyUpdates) > 0 {
+		values := []string{}
+		args := []interface{}{}
+		for _, d := range dailyUpdates {
+			values = append(values, "(?, ?, ?, ?)")
+			args = append(args, d.PurchaseID, today, d.Increment, d.MaxPerDay)
+		}
+		query := fmt.Sprintf(`
+            INSERT INTO package_daily_statuses (purchase_id, date, used_today, max_usage_per_day)
+            VALUES %s
+            ON DUPLICATE KEY UPDATE used_today = used_today + VALUES(used_today)`,
+			strings.Join(values, ","),
+		)
+		if err := tx.Exec(query, args...).Error; err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+
+	// Batch insert usages
+	if len(usages) > 0 {
+		if err := tx.Create(&usages).Error; err != nil {
+			tx.Rollback()
+			return err
 		}
 	}
 
@@ -440,13 +655,18 @@ func (s *serviceImpl) skipAdsFromDB(ctx context.Context, userID uint, quantity u
 		return err
 	}
 
-	// Only cache packages that have usable skip ads
+	// Update cache
+	var validPackagesForCache []dtos.AvailablePackageUser
+	for _, pkg := range availablePackagesUser {
+		if pkg.Remaining > 0 && pkg.UsedToday < pkg.MaxUsagePerDay {
+			validPackagesForCache = append(validPackagesForCache, pkg)
+		}
+	}
 	if len(validPackagesForCache) > 0 {
 		if err := s.redisService.SetUserPackages(ctx, userID, validPackagesForCache); err != nil {
 			log.Printf("Failed to update cache after DB operation for user %d: %v", userID, err)
 		}
 	} else {
-		// If no valid packages left, delete cache
 		if err := s.redisService.DeleteUserPackages(ctx, userID); err != nil {
 			log.Printf("Failed to delete cache for user %d: %v", userID, err)
 		}
@@ -454,9 +674,8 @@ func (s *serviceImpl) skipAdsFromDB(ctx context.Context, userID uint, quantity u
 
 	return nil
 }
-
 func (s *serviceImpl) syncRedisToDatabase(ctx context.Context, userID uint, today time.Time, usedPackagesJSON string, quantity uint32) error {
-	var usedPackages []models.UsedPackageInfo
+	var usedPackages []dtos.UsedPackageInfo
 	if err := json.Unmarshal([]byte(usedPackagesJSON), &usedPackages); err != nil {
 		return fmt.Errorf("failed to parse used packages JSON: %w", err)
 	}
@@ -470,7 +689,7 @@ func (s *serviceImpl) syncRedisToDatabase(ctx context.Context, userID uint, toda
 
 	// Step 1: Collect all purchase IDs and lock them in one query
 	purchaseIDs := make([]uint, len(usedPackages))
-	usedPackageMap := make(map[uint]models.UsedPackageInfo)
+	usedPackageMap := make(map[uint]dtos.UsedPackageInfo)
 
 	for i, usedPkg := range usedPackages {
 		purchaseIDs[i] = usedPkg.PurchaseID
@@ -481,7 +700,7 @@ func (s *serviceImpl) syncRedisToDatabase(ctx context.Context, userID uint, toda
 	var purchases []models.Purchase
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("id IN (?)", purchaseIDs).
-		Order("expires_at ASC"). // Same ordering as skipAdsFromDB to prevent deadlocks
+		Order("expires_at ASC, id ASC").
 		Find(&purchases).Error; err != nil {
 		tx.Rollback()
 		return fmt.Errorf("failed to lock purchases: %w", err)
@@ -562,7 +781,7 @@ func min(a, b uint32) uint32 {
 	return b
 }
 
-func (s *serviceImpl) CreateBatchPurchase(ctx context.Context, userID uint32, requests []models.BatchPurchaseRequest) error {
+func (s *serviceImpl) CreateBatchPurchase(ctx context.Context, userID uint32, requests []dtos.BatchPurchaseRequest) error {
 	if len(requests) == 0 {
 		return errors.New("no purchase requests provided")
 	}

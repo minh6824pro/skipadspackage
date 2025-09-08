@@ -18,5 +18,6 @@ func RegisterRoutes(router *gin.RouterGroup, db *gorm.DB, redisService internal.
 		ads.GET("/purchase/:id", controller.GetPurchaseByUserID)
 		ads.POST("/skip/", controller.SkipAds)
 		ads.POST("/purchasebatch/", controller.CreateBatchPurchase)
+		ads.GET("/remaining_skip", controller.GetRemainingSkipAdsAll)
 	}
 }

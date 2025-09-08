@@ -2,7 +2,9 @@ package handler
 
 import (
 	"SkipAds/internal"
+	"SkipAds/internal/dtos"
 	"SkipAds/internal/models"
+	"fmt"
 	"github.com/gin-gonic/gin"
 	"net/http"
 	"strconv"
@@ -32,17 +34,20 @@ func (controller *Controller) CreatePurchase(ctx *gin.Context) {
 }
 
 func (controller *Controller) CreateBatchPurchase(ctx *gin.Context) {
-	var m []models.BatchPurchaseRequest
+	var m []dtos.BatchPurchaseRequest
 	if err := ctx.ShouldBindJSON(&m); err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	err := controller.service.CreateBatchPurchase(ctx, 2, m)
-
-	if err != nil {
-		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
+	for i := uint32(1); i < 61; i++ {
+		controller.service.CreateBatchPurchase(ctx, i, m)
 	}
+	//err := controller.service.CreateBatchPurchase(ctx, 2, m)
+	//
+	//if err != nil {
+	//	ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	//	return
+	//}
 	ctx.JSON(http.StatusCreated, m)
 }
 
@@ -65,6 +70,25 @@ func (controller *Controller) GetRemainingSkipAds(ctx *gin.Context) {
 	}
 	ctx.JSON(http.StatusOK, skipAds)
 }
+func (controller *Controller) GetRemainingSkipAdsAll(ctx *gin.Context) {
+	var results []interface{}
+
+	for i := 1; i <= 10; i++ {
+		skipAds, err := controller.service.GetRemainingSkipAds2(ctx, uint(i))
+		if err != nil {
+			ctx.JSON(http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("id=%d: %s", i, err.Error()),
+			})
+			return
+		}
+		results = append(results, gin.H{
+			"id":      i,
+			"skipAds": skipAds,
+		})
+	}
+
+	ctx.JSON(http.StatusOK, results)
+}
 
 func (controller *Controller) SkipAds(ctx *gin.Context) {
 	var user models.User
@@ -72,7 +96,7 @@ func (controller *Controller) SkipAds(ctx *gin.Context) {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	err := controller.service.SkipAds2(ctx, user.ID, 1)
+	err := controller.service.SkipAds2(ctx, user.ID, 3)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
 		return
