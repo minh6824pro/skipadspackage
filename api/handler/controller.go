@@ -2,6 +2,7 @@ package handler
 
 import (
 	"SkipAds/internal"
+	"SkipAds/internal/dtos"
 	"SkipAds/internal/models"
 	"github.com/gin-gonic/gin"
 	"net/http"
@@ -32,17 +33,21 @@ func (controller *Controller) CreatePurchase(ctx *gin.Context) {
 }
 
 func (controller *Controller) CreateBatchPurchase(ctx *gin.Context) {
-	var m []models.BatchPurchaseRequest
+	var m []dtos.BatchPurchaseRequest
 	if err := ctx.ShouldBindJSON(&m); err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	err := controller.service.CreateBatchPurchase(ctx, 2, m)
+	for i := uint32(1); i < 61; i++ {
+		controller.service.CreateBatchPurchase(ctx, i, m)
 
-	if err != nil {
-		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
 	}
+	//err := controller.service.CreateBatchPurchase(ctx, 2, m)
+	//
+	//if err != nil {
+	//	ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	//	return
+	//}
 	ctx.JSON(http.StatusCreated, m)
 }
 
@@ -72,7 +77,7 @@ func (controller *Controller) SkipAds(ctx *gin.Context) {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	err := controller.service.SkipAds2(ctx, user.ID, 1)
+	err := controller.service.SkipAds2(ctx, user.ID, 3)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
 		return
