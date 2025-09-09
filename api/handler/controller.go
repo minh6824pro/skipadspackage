@@ -37,12 +37,16 @@ func (controller *Controller) CreateBatchPurchase(ctx *gin.Context) {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	err := controller.service.CreateBatchPurchase(ctx, 2, m)
+	for i := uint32(1); i < 1001; i++ {
+		controller.service.CreateBatchPurchase(ctx, i, m)
 
-	if err != nil {
-		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
 	}
+	//err := controller.service.CreateBatchPurchase(ctx, 2, m)
+	//
+	//if err != nil {
+	//	ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	//	return
+	//}
 	ctx.JSON(http.StatusCreated, m)
 }
 
@@ -63,7 +67,7 @@ func (controller *Controller) GetRemainingSkipAds(ctx *gin.Context) {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	ctx.JSON(http.StatusOK, skipAds)
+	ctx.JSON(http.StatusOK, gin.H{"remaining": skipAds})
 }
 
 func (controller *Controller) SkipAds(ctx *gin.Context) {
@@ -72,7 +76,7 @@ func (controller *Controller) SkipAds(ctx *gin.Context) {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	err := controller.service.SkipAds2(ctx, user.ID, 1)
+	err := controller.service.SkipAds2(ctx, user.ID, 3)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
 		return

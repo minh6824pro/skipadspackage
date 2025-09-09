@@ -13,6 +13,8 @@ import (
 type RedisPackageService interface {
 	SetUserPackages(ctx context.Context, userID uint, packages []models.AvailablePackageUser) error
 	GetUserPackages(ctx context.Context, userID uint) ([]models.AvailablePackageUser, error)
+	SetUserStock(ctx context.Context, userID uint, quantity uint32, haveStock bool) error
+	GetUserStock(ctx context.Context, userID uint, quantity uint32) (bool, error)
 	DeleteUserPackages(ctx context.Context, userID uint) error
 	UpdateUserPackages(ctx context.Context, userID uint, packages []models.AvailablePackageUser) error
 	ExecuteLuaScript(ctx context.Context, script string, keys []string, args ...interface{}) (interface{}, error)
@@ -27,8 +29,9 @@ type redisPackageService struct {
 }
 
 const (
-	KeyPattern = "user:%d:packages" // user:123:packages
-	DefaultTTL = 12 * time.Hour     // Cache 12 hours
+	UserPackageKeyPattern    = "user:%d:packages" // user:123:packages
+	UserCheckStockKeyPattern = "user:%d:checkstock:%d:false"
+	DefaultTTL               = 12 * time.Hour // Cache 12 hours
 )
 
 func NewRedisPackageService(client *redis.Client) RedisPackageService {
@@ -38,9 +41,30 @@ func NewRedisPackageService(client *redis.Client) RedisPackageService {
 	}
 }
 
+// SetUserStock:  haveStock=false → create key, if haveStock=true → delete key
+func (r *redisPackageService) SetUserStock(ctx context.Context, userID uint, quantity uint32, haveStock bool) error {
+
+	key := fmt.Sprintf(UserCheckStockKeyPattern, userID, quantity)
+	if !haveStock {
+		return r.client.Set(ctx, key, 1, 0).Err() // TTL=0 = không hết hạn
+	} else {
+		return r.client.Del(ctx, key).Err()
+	}
+}
+
+// GetUserStock: key exists → no stock in db stock=false, key not exists → còn stock=true
+func (r *redisPackageService) GetUserStock(ctx context.Context, userID uint, quantity uint32) (bool, error) {
+	key := fmt.Sprintf(UserCheckStockKeyPattern, userID, quantity)
+	exists, err := r.client.Exists(ctx, key).Result()
+	if err != nil {
+		return false, err
+	}
+	return exists == 0, nil
+}
+
 // Set packages array for user
 func (r *redisPackageService) SetUserPackages(ctx context.Context, userID uint, packages []models.AvailablePackageUser) error {
-	key := fmt.Sprintf(KeyPattern, userID)
+	key := fmt.Sprintf(UserPackageKeyPattern, userID)
 
 	// Convert array to JSON
 	jsonData, err := json.Marshal(packages)
@@ -54,7 +78,7 @@ func (r *redisPackageService) SetUserPackages(ctx context.Context, userID uint, 
 
 // Get packages array for user
 func (r *redisPackageService) GetUserPackages(ctx context.Context, userID uint) ([]models.AvailablePackageUser, error) {
-	key := fmt.Sprintf(KeyPattern, userID)
+	key := fmt.Sprintf(UserPackageKeyPattern, userID)
 
 	// Get JSON from Redis
 	jsonData, err := r.client.Get(ctx, key).Result()
@@ -82,30 +106,20 @@ func (r *redisPackageService) UpdateUserPackages(ctx context.Context, userID uin
 
 // Delete packages for user
 func (r *redisPackageService) DeleteUserPackages(ctx context.Context, userID uint) error {
-	key := fmt.Sprintf(KeyPattern, userID)
+	key := fmt.Sprintf(UserPackageKeyPattern, userID)
 	return r.client.Del(ctx, key).Err()
 }
 
 func (r *redisPackageService) ExecuteLuaScript(ctx context.Context, script string, keys []string, args ...interface{}) (interface{}, error) {
 	return r.client.Eval(ctx, script, keys, args...).Result()
 }
-
 func (r *redisPackageService) AcquireLock(ctx context.Context, key string, expiration time.Duration) (bool, error) {
-	luaScript := `
-        if redis.call("GET", KEYS[1]) == false then
-            redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
-            return 1
-        else
-            return 0
-        end
-    `
-
-	result, err := r.client.Eval(ctx, luaScript, []string{key}, "locked", int(expiration.Seconds())).Result()
+	// SET NX EX trực tiếp
+	ok, err := r.client.SetNX(ctx, key, "locked", expiration).Result()
 	if err != nil {
 		return false, err
 	}
-
-	return result.(int64) == 1, nil
+	return ok, nil
 }
 
 func (r *redisPackageService) ReleaseLock(ctx context.Context, key string) error {

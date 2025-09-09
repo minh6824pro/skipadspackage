@@ -21,8 +21,8 @@ func ConnectDatabase() {
 		log.Fatal("Failed to get sql.DB from gorm:", err)
 	}
 
-	sqlDB.SetMaxOpenConns(20)
-	sqlDB.SetMaxIdleConns(10)
+	sqlDB.SetMaxOpenConns(120)
+	sqlDB.SetMaxIdleConns(30)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
 	sqlDB.SetConnMaxIdleTime(10 * time.Minute)
 
