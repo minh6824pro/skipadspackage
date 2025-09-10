@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
+	"time"
+
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
-	"log"
-	"time"
 )
 
 type Service interface {
@@ -423,9 +425,22 @@ return {1, "success", tickets_needed, cjson.encode(used_packages_info)}`
 
 func (s *serviceImpl) skipAdsFromDB(ctx context.Context, userID uint, quantity uint32, today time.Time) error {
 	tx := s.db.Begin()
+	if tx.Error != nil {
+		return fmt.Errorf("failed to begin transaction: %w", tx.Error)
+	}
+
+	// Proper rollback mechanism
+	var committed bool
 	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
+		if !committed {
+			if r := recover(); r != nil {
+				log.Printf("Transaction panic for user %d, rolling back: %v", userID, r)
+				tx.Rollback()
+				panic(r) // Re-panic after rollback
+			} else {
+				log.Printf("Transaction not committed for user %d, rolling back", userID)
+				tx.Rollback()
+			}
 		}
 	}()
 
@@ -453,12 +468,10 @@ func (s *serviceImpl) skipAdsFromDB(ctx context.Context, userID uint, quantity u
 		LIMIT 50 
 		FOR UPDATE OF p, daily
 	`, today, userID).Scan(&availablePackagesUser).Error; err != nil {
-		tx.Rollback()
 		return err
 	}
 
 	if len(availablePackagesUser) == 0 {
-		tx.Rollback()
 		return errors.New("no available packages")
 	}
 
@@ -472,15 +485,18 @@ func (s *serviceImpl) skipAdsFromDB(ctx context.Context, userID uint, quantity u
 	}
 
 	if totalAvailable < quantity {
-		tx.Rollback()
 		s.redisService.SetUserStock(ctx, userID, quantity, false)
 		return errors.New("insufficient quota3")
 	}
 
 	// =========================
-	// Step 3: Allocate usage
+	// Step 3: Allocate usage và prepare batch operations
 	// =========================
 	remainingToUse := quantity
+	var purchaseUpdates []PurchaseUpdate
+	var dailyStatusUpdates []DailyStatusUpdate
+	var usageRecords []UsageRecord
+
 	for i := range availablePackagesUser {
 		if remainingToUse == 0 {
 			break
@@ -493,40 +509,54 @@ func (s *serviceImpl) skipAdsFromDB(ctx context.Context, userID uint, quantity u
 			continue
 		}
 
-		// 1️⃣ Update purchase.remaining (reuse lock)
+		// Update local state for cache building later
 		pkg.Remaining -= useFromThis
 		pkg.UsedToday += useFromThis
-		if err := tx.Model(&models.Purchase{}).
-			Where("id = ?", pkg.PurchaseID).
-			Update("remaining", pkg.Remaining).Error; err != nil {
-			tx.Rollback()
-			return err
-		}
 
-		// 2️⃣ Update daily status safely (lock inside updateOrCreateDailyStatus)
-		if err := s.updateOrCreateDailyStatus(ctx, tx, pkg.PurchaseID, today, useFromThis, pkg.MaxUsagePerDay); err != nil {
-			tx.Rollback()
-			return err
-		}
+		// Prepare batch updates (will execute with proper locking)
+		purchaseUpdates = append(purchaseUpdates, PurchaseUpdate{
+			ID:               pkg.PurchaseID,
+			QuantityToReduce: useFromThis,
+		})
 
-		// 3️⃣ Create usage record
-		usage := models.Usage{
+		dailyStatusUpdates = append(dailyStatusUpdates, DailyStatusUpdate{
+			PurchaseID:     pkg.PurchaseID,
+			Date:           today,
+			QuantityToAdd:  useFromThis,
+			MaxUsagePerDay: pkg.MaxUsagePerDay,
+		})
+
+		usageRecords = append(usageRecords, UsageRecord{
 			PurchaseID:  pkg.PurchaseID,
 			UseQuantity: useFromThis,
 			UseFor:      "skip_ads",
 			CreatedAt:   time.Now(),
-		}
-		if err := tx.Create(&usage).Error; err != nil {
-			tx.Rollback()
-			return err
-		}
+		})
 
 		remainingToUse -= useFromThis
 	}
 
 	if remainingToUse > 0 {
-		tx.Rollback()
 		return errors.New("failed to allocate all quota")
+	}
+
+	// =========================
+	// Step 4: Execute batch operations (maintains lock consistency)
+	// =========================
+
+	// 1. Batch update purchases (uses existing row locks from Step 1)
+	if err := s.batchUpdatePurchases(tx, purchaseUpdates); err != nil {
+		return fmt.Errorf("failed to batch update purchases: %w", err)
+	}
+
+	// 2. Batch update/create daily status (handles concurrency with UPSERT)
+	if err := s.batchUpdateOrCreateDailyStatus(tx, dailyStatusUpdates); err != nil {
+		return fmt.Errorf("failed to batch update daily status: %w", err)
+	}
+
+	// 3. Batch create usage records
+	if err := s.batchCreateUsageRecords(tx, usageRecords); err != nil {
+		return fmt.Errorf("failed to batch create usage records: %w", err)
 	}
 
 	// =========================
@@ -535,6 +565,8 @@ func (s *serviceImpl) skipAdsFromDB(ctx context.Context, userID uint, quantity u
 	if err := tx.Commit().Error; err != nil {
 		return err
 	}
+
+	committed = true
 
 	// =========================
 	// Step 5: Update cache
@@ -571,9 +603,22 @@ func (s *serviceImpl) syncRedisToDatabase(ctx context.Context, userID uint, toda
 	}
 
 	tx := s.db.Begin()
+	if tx.Error != nil {
+		return fmt.Errorf("failed to begin transaction: %w", tx.Error)
+	}
+
+	// Proper rollback mechanism
+	var committed bool
 	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
+		if !committed {
+			if r := recover(); r != nil {
+				log.Printf("Transaction panic for user %d, rolling back: %v", userID, r)
+				tx.Rollback()
+				panic(r) // Re-panic after rollback
+			} else {
+				log.Printf("Transaction not committed for user %d, rolling back", userID)
+				tx.Rollback()
+			}
 		}
 	}()
 
@@ -592,7 +637,6 @@ func (s *serviceImpl) syncRedisToDatabase(ctx context.Context, userID uint, toda
 		Where("id IN (?)", purchaseIDs).
 		Order("expires_at ASC, id ASC"). // Same ordering as skipAdsFromDB to prevent deadlocks
 		Find(&purchases).Error; err != nil {
-		tx.Rollback()
 		return fmt.Errorf("failed to lock purchases: %w", err)
 	}
 
@@ -600,69 +644,63 @@ func (s *serviceImpl) syncRedisToDatabase(ctx context.Context, userID uint, toda
 	for _, purchase := range purchases {
 		usedPkg := usedPackageMap[purchase.ID]
 		if purchase.Remaining < usedPkg.TicketsUsed {
-			tx.Rollback()
-			log.Println("insufficient , concurrency problem retry ")
+			log.Printf("Insufficient remaining for user %d, purchase %d: has %d, needs %d",
+				userID, purchase.ID, purchase.Remaining, usedPkg.TicketsUsed)
 			return fmt.Errorf("insufficient remaining for purchase %d: has %d, needs %d",
 				purchase.ID, purchase.Remaining, usedPkg.TicketsUsed)
 		}
 	}
 
-	// Step 4: Batch update all purchases
+	// Step 4: Prepare batch operations
+	var purchaseUpdates []PurchaseUpdate
+	var dailyStatusUpdates []DailyStatusUpdate
+	var usageRecords []UsageRecord
+
 	for _, purchase := range purchases {
 		usedPkg := usedPackageMap[purchase.ID]
 
-		// Update remaining
-		if err := tx.Model(&models.Purchase{}).
-			Where("id = ?", purchase.ID).
-			Update("remaining", gorm.Expr("remaining - ?", usedPkg.TicketsUsed)).Error; err != nil {
-			tx.Rollback()
-			return fmt.Errorf("failed to update purchase %d: %w", purchase.ID, err)
-		}
+		// Prepare batch updates
+		purchaseUpdates = append(purchaseUpdates, PurchaseUpdate{
+			ID:               purchase.ID,
+			QuantityToReduce: usedPkg.TicketsUsed,
+		})
 
-		// Update daily status
-		if err := s.updateOrCreateDailyStatus(ctx, tx, usedPkg.PurchaseID, today, usedPkg.TicketsUsed, usedPkg.MaxUsagePerDay); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("failed to update daily status for purchase %d: %w", purchase.ID, err)
-		}
+		dailyStatusUpdates = append(dailyStatusUpdates, DailyStatusUpdate{
+			PurchaseID:     usedPkg.PurchaseID,
+			Date:           today,
+			QuantityToAdd:  usedPkg.TicketsUsed,
+			MaxUsagePerDay: usedPkg.MaxUsagePerDay,
+		})
 
-		// Create usage record
-		usage := models.Usage{
+		usageRecords = append(usageRecords, UsageRecord{
 			PurchaseID:  usedPkg.PurchaseID,
 			UseQuantity: usedPkg.TicketsUsed,
 			UseFor:      "skip_ads",
 			CreatedAt:   time.Now(),
-		}
-
-		if err := tx.Create(&usage).Error; err != nil {
-			tx.Rollback()
-			return fmt.Errorf("failed to create usage record for purchase %d: %w", purchase.ID, err)
-		}
+		})
 	}
 
-	return tx.Commit().Error
-}
-func (s *serviceImpl) updateOrCreateDailyStatus(ctx context.Context, tx *gorm.DB, purchaseID uint, date time.Time, usedQuantity uint32, maxUsagePerDay uint32) error {
-	var dailyStatus models.PackageDailyStatus
-	err := tx.Where("purchase_id = ? AND date = ?", purchaseID, date).
-		First(&dailyStatus).Error
-
-	if err == gorm.ErrRecordNotFound {
-		// Create package daily
-		dailyStatus = models.PackageDailyStatus{
-			PurchaseID:     purchaseID,
-			Date:           date,
-			UsedToday:      usedQuantity,
-			MaxUsagePerDay: maxUsagePerDay,
-		}
-		return tx.Create(&dailyStatus).Error
-	} else if err != nil {
-		return err
+	// Execute batch operations
+	if err := s.batchUpdatePurchases(tx, purchaseUpdates); err != nil {
+		return fmt.Errorf("failed to batch update purchases: %w", err)
 	}
 
-	// Update existing
-	return tx.Model(&dailyStatus).
-		Where("id = ?", dailyStatus.ID).
-		Update("used_today", gorm.Expr("used_today + ?", usedQuantity)).Error
+	if err := s.batchUpdateOrCreateDailyStatus(tx, dailyStatusUpdates); err != nil {
+		return fmt.Errorf("failed to batch update daily status: %w", err)
+	}
+
+	if err := s.batchCreateUsageRecords(tx, usageRecords); err != nil {
+		return fmt.Errorf("failed to batch create usage records: %w", err)
+	}
+
+	// Commit transaction
+	if err := tx.Commit().Error; err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	committed = true
+	log.Printf("Transaction committed successfully for user %d", userID)
+	return nil
 }
 
 func min(a, b uint32) uint32 {
@@ -670,6 +708,129 @@ func min(a, b uint32) uint32 {
 		return a
 	}
 	return b
+}
+
+// Batch operation structs for maintaining consistency
+type PurchaseUpdate struct {
+	ID               uint
+	QuantityToReduce uint32
+}
+
+type DailyStatusUpdate struct {
+	PurchaseID     uint
+	Date           time.Time
+	QuantityToAdd  uint32
+	MaxUsagePerDay uint32
+}
+
+type UsageRecord struct {
+	PurchaseID  uint
+	UseQuantity uint32
+	UseFor      string
+	CreatedAt   time.Time
+}
+
+// Batch update purchases with proper locking consistency
+func (s *serviceImpl) batchUpdatePurchases(tx *gorm.DB, updates []PurchaseUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+
+	// Build batch update SQL with CASE statement
+	var caseWhen []string
+	var args []interface{}
+	var purchaseIDs []interface{}
+
+	for _, update := range updates {
+		caseWhen = append(caseWhen, "WHEN id = ? THEN remaining - ?")
+		args = append(args, update.ID, update.QuantityToReduce)
+		purchaseIDs = append(purchaseIDs, update.ID)
+	}
+
+	// Create placeholders for IN clause
+	placeholders := strings.Repeat("?,", len(purchaseIDs)-1) + "?"
+
+	sql := fmt.Sprintf(
+		"UPDATE purchases SET remaining = CASE %s END WHERE id IN (%s)",
+		strings.Join(caseWhen, " "),
+		placeholders,
+	)
+
+	// Combine args
+	finalArgs := append(args, purchaseIDs...)
+
+	return tx.Exec(sql, finalArgs...).Error
+}
+
+// Batch update/create daily status with MySQL UPSERT ensuring consistency
+func (s *serviceImpl) batchUpdateOrCreateDailyStatus(tx *gorm.DB, updates []DailyStatusUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+
+	// Group updates by (purchase_id, date) to avoid duplicates
+	updateMap := make(map[string]DailyStatusUpdate)
+	for _, update := range updates {
+		key := fmt.Sprintf("%d_%s", update.PurchaseID, update.Date.Format("2006-01-02"))
+		if existing, exists := updateMap[key]; exists {
+			// Merge updates for same purchase_id and date
+			existing.QuantityToAdd += update.QuantityToAdd
+			updateMap[key] = existing
+		} else {
+			updateMap[key] = update
+		}
+	}
+
+	// Convert back to slice
+	var dedupedUpdates []DailyStatusUpdate
+	for _, update := range updateMap {
+		dedupedUpdates = append(dedupedUpdates, update)
+	}
+
+	// Build MySQL UPSERT query
+	valueStrings := make([]string, 0, len(dedupedUpdates))
+	valueArgs := make([]interface{}, 0, len(dedupedUpdates)*4)
+
+	for _, update := range dedupedUpdates {
+		valueStrings = append(valueStrings, "(?, ?, ?, ?)")
+		valueArgs = append(valueArgs,
+			update.PurchaseID,
+			update.Date,
+			update.QuantityToAdd,
+			update.MaxUsagePerDay,
+		)
+	}
+
+	sql := fmt.Sprintf(`
+		INSERT INTO package_daily_statuses (purchase_id, date, used_today, max_usage_per_day) 
+		VALUES %s 
+		ON DUPLICATE KEY UPDATE 
+			used_today = used_today + VALUES(used_today),
+			max_usage_per_day = VALUES(max_usage_per_day)
+	`, strings.Join(valueStrings, ","))
+
+	return tx.Exec(sql, valueArgs...).Error
+}
+
+// Batch create usage records
+func (s *serviceImpl) batchCreateUsageRecords(tx *gorm.DB, records []UsageRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+
+	// Convert to GORM models
+	var usages []models.Usage
+	for _, record := range records {
+		usages = append(usages, models.Usage{
+			PurchaseID:  record.PurchaseID,
+			UseQuantity: record.UseQuantity,
+			UseFor:      record.UseFor,
+			CreatedAt:   record.CreatedAt,
+		})
+	}
+
+	// Use GORM's batch insert
+	return tx.CreateInBatches(usages, 100).Error
 }
 
 func (s *serviceImpl) CreateBatchPurchase(ctx context.Context, userID uint32, requests []models.BatchPurchaseRequest) error {

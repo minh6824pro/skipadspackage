@@ -15,7 +15,7 @@ func AutoMigrate() {
 	)
 
 	DB.Exec("CREATE INDEX idx_purchases_user_expires_id ON purchases (user_id, expires_at, id)")
-	DB.Exec("CREATE INDEX idx_daily_purchase_date ON package_daily_statuses (purchase_id, date)")
+	DB.Exec("CREATE INDEX idx_daily_purchase_date ON package_daily_statuses (purchase_id)")
 
 	if err != nil {
 		log.Fatalf("Migration failed: %v", err)
