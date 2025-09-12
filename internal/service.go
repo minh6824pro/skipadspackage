@@ -174,7 +174,10 @@ end
 
 -- Return success
 return {1, "success", tickets_needed, cjson.encode(used_packages_info)}`
-
+	check, err := s.redisService.LockExists(ctx, lockKey)
+	if check && err == nil {
+		return s.waitAndRetryCache(ctx, userID, quantity, today, lockKey)
+	}
 	// Execute Lua script
 	result, err := s.redisService.ExecuteLuaScript(ctx, luaScript, []string{cacheKey}, currentTimeUnix, quantity)
 
@@ -396,7 +399,7 @@ return {1, "success", tickets_needed, cjson.encode(used_packages_info)}`
 						err := s.syncRedisToDatabase(ctx, userID, today, usedPackagesJSON, quantity)
 						if err != nil {
 							s.redisService.DeleteUserPackages(ctx, userID)
-							return errors.New("DB sync failure3 ")
+							return errors.New("DB sync failure3 " + err.Error())
 						}
 					}
 					return nil
@@ -459,6 +462,7 @@ func (s *serviceImpl) skipAdsFromDB(ctx context.Context, userID uint, quantity u
 		FROM purchases p
 		INNER JOIN packages pkg ON p.package_id = pkg.id
 		LEFT JOIN package_daily_statuses daily
+		    USE INDEX (idx_daily_purchase_id) 
 			ON p.id = daily.purchase_id AND daily.date = ?
 		WHERE p.user_id = ?
 		  AND p.expires_at > NOW()
@@ -549,9 +553,16 @@ func (s *serviceImpl) skipAdsFromDB(ctx context.Context, userID uint, quantity u
 		return fmt.Errorf("failed to batch update purchases: %w", err)
 	}
 
-	// 2. Batch update/create daily status (handles concurrency with UPSERT)
-	if err := s.batchUpdateOrCreateDailyStatus(tx, dailyStatusUpdates); err != nil {
-		return fmt.Errorf("failed to batch update daily status: %w", err)
+	// 2. Update daily status individually with proper locking and validation
+	for _, update := range dailyStatusUpdates {
+		if err := s.updateOrCreateDailyStatus(ctx, tx, update.PurchaseID, update.Date, update.QuantityToAdd, update.MaxUsagePerDay); err != nil {
+			// Check if this is a daily limit violation
+			if strings.Contains(err.Error(), "daily usage limit exceeded") {
+				log.Printf("Daily usage limit exceeded for user %d, purchase %d: %v", userID, update.PurchaseID, err)
+				return fmt.Errorf("daily usage limit exceeded: %w", err)
+			}
+			return fmt.Errorf("failed to update daily status for purchase %d: %w", update.PurchaseID, err)
+		}
 	}
 
 	// 3. Batch create usage records
@@ -685,8 +696,16 @@ func (s *serviceImpl) syncRedisToDatabase(ctx context.Context, userID uint, toda
 		return fmt.Errorf("failed to batch update purchases: %w", err)
 	}
 
-	if err := s.batchUpdateOrCreateDailyStatus(tx, dailyStatusUpdates); err != nil {
-		return fmt.Errorf("failed to batch update daily status: %w", err)
+	// Update daily status individually with proper locking and validation
+	for _, update := range dailyStatusUpdates {
+		if err := s.updateOrCreateDailyStatus(ctx, tx, update.PurchaseID, update.Date, update.QuantityToAdd, update.MaxUsagePerDay); err != nil {
+			// Check if this is a daily limit violation
+			if strings.Contains(err.Error(), "daily usage limit exceeded") {
+				log.Printf("Daily usage limit exceeded for user %d, purchase %d: %v", userID, update.PurchaseID, err)
+				return fmt.Errorf("daily usage limit exceeded: %w", err)
+			}
+			return fmt.Errorf("failed to update daily status for purchase %d: %w", update.PurchaseID, err)
+		}
 	}
 
 	if err := s.batchCreateUsageRecords(tx, usageRecords); err != nil {
@@ -699,7 +718,6 @@ func (s *serviceImpl) syncRedisToDatabase(ctx context.Context, userID uint, toda
 	}
 
 	committed = true
-	log.Printf("Transaction committed successfully for user %d", userID)
 	return nil
 }
 
@@ -762,54 +780,53 @@ func (s *serviceImpl) batchUpdatePurchases(tx *gorm.DB, updates []PurchaseUpdate
 	return tx.Exec(sql, finalArgs...).Error
 }
 
-// Batch update/create daily status with MySQL UPSERT ensuring consistency
-func (s *serviceImpl) batchUpdateOrCreateDailyStatus(tx *gorm.DB, updates []DailyStatusUpdate) error {
-	if len(updates) == 0 {
+// Update or create daily status with atomic constraints to prevent exceeding max_usage_per_day
+func (s *serviceImpl) updateOrCreateDailyStatus(ctx context.Context, tx *gorm.DB, purchaseID uint, date time.Time, usedQuantity uint32, maxUsagePerDay uint32) error {
+	// Use a database-level approach to prevent race conditions
+	// Try to update existing record with constraint check
+	result := tx.Exec(`
+		UPDATE package_daily_statuses 
+		SET used_today = used_today + ?
+		WHERE purchase_id = ? AND date = ? 
+		AND used_today + ? <= max_usage_per_day
+	`, usedQuantity, purchaseID, date, usedQuantity)
+
+	if result.Error != nil {
+		return result.Error
+	}
+
+	// If update affected a row, we're done
+	if result.RowsAffected > 0 {
 		return nil
 	}
 
-	// Group updates by (purchase_id, date) to avoid duplicates
-	updateMap := make(map[string]DailyStatusUpdate)
-	for _, update := range updates {
-		key := fmt.Sprintf("%d_%s", update.PurchaseID, update.Date.Format("2006-01-02"))
-		if existing, exists := updateMap[key]; exists {
-			// Merge updates for same purchase_id and date
-			existing.QuantityToAdd += update.QuantityToAdd
-			updateMap[key] = existing
-		} else {
-			updateMap[key] = update
+	// No rows affected - either record doesn't exist or would exceed limit
+	// Check if record exists
+	var existingStatus models.PackageDailyStatus
+	err := tx.Where("purchase_id = ? AND date = ?", purchaseID, date).First(&existingStatus).Error
+
+	if err == gorm.ErrRecordNotFound {
+		// Record doesn't exist, create new one
+		// First check if the usedQuantity would exceed max on creation
+		if usedQuantity > maxUsagePerDay {
+			return fmt.Errorf("daily usage limit exceeded for purchase_id %d: requested=%d, limit=%d",
+				purchaseID, usedQuantity, maxUsagePerDay)
 		}
+
+		newStatus := models.PackageDailyStatus{
+			PurchaseID:     purchaseID,
+			Date:           date,
+			UsedToday:      usedQuantity,
+			MaxUsagePerDay: maxUsagePerDay,
+		}
+		return tx.Create(&newStatus).Error
+	} else if err != nil {
+		return err
 	}
 
-	// Convert back to slice
-	var dedupedUpdates []DailyStatusUpdate
-	for _, update := range updateMap {
-		dedupedUpdates = append(dedupedUpdates, update)
-	}
-
-	// Build MySQL UPSERT query
-	valueStrings := make([]string, 0, len(dedupedUpdates))
-	valueArgs := make([]interface{}, 0, len(dedupedUpdates)*4)
-
-	for _, update := range dedupedUpdates {
-		valueStrings = append(valueStrings, "(?, ?, ?, ?)")
-		valueArgs = append(valueArgs,
-			update.PurchaseID,
-			update.Date,
-			update.QuantityToAdd,
-			update.MaxUsagePerDay,
-		)
-	}
-
-	sql := fmt.Sprintf(`
-		INSERT INTO package_daily_statuses (purchase_id, date, used_today, max_usage_per_day) 
-		VALUES %s 
-		ON DUPLICATE KEY UPDATE 
-			used_today = used_today + VALUES(used_today),
-			max_usage_per_day = VALUES(max_usage_per_day)
-	`, strings.Join(valueStrings, ","))
-
-	return tx.Exec(sql, valueArgs...).Error
+	// Record exists but update didn't happen - means we would exceed the limit
+	return fmt.Errorf("daily usage limit exceeded for purchase_id %d: current=%d, requested=%d, limit=%d",
+		purchaseID, existingStatus.UsedToday, usedQuantity, maxUsagePerDay)
 }
 
 // Batch create usage records
